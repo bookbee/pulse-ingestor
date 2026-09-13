@@ -96,9 +96,12 @@ four-plus repos.
   date is the **write** date in UTC, not an event timestamp.
 - The word is **staging**, never "bronze" — a transient landing pad with no
   retention promise.
-- **The gateway does not write Kafka at this commit.** Its only producer is
-  Redis. Kafka is provisioned for this service and fed by its own tests and
-  `pulse-client`; the `gateway → Kafka` edge in the platform diagram is unbuilt.
+- **The gateway's Kafka producer is in development** (`pulse-gateway`, specced
+  as D8–D13; a `queue.Producer` interface exists but there is no Kafka client
+  dependency yet). Until it lands, its only live producer is Redis and these
+  topics are fed by this service's own tests and `pulse-client` — so an empty
+  topic locally is expected, not a bug. Re-check the gateway before assuming a
+  consume-loop problem.
 
 ## Local development
 
@@ -110,10 +113,14 @@ From the host, brokers are `localhost:19092,19093,19094`; inside the stack's
 Docker network they are `kafka-1:9092,kafka-2:9092,kafka-3:9092`. GCS is
 `localhost:4443` / `fake-gcs:4443`, unauthenticated.
 
-**The GCS write path is unverified for auth locally.** The emulator has no IAM,
-serves plain HTTP, and returns different error bodies, so scopes, ADC, token
-refresh, 401-vs-403-vs-429 handling and TLS are all untested. A green local run
-is not a deployable artifact — see `../pulse-infra/docs/divergences.md`.
+**Develop against the emulator; GCS auth is validated at dev deployment.** That
+is a deliberate decision, not an oversight. The emulator has no IAM, serves
+plain HTTP, and returns different error bodies, so scopes, ADC, token refresh,
+401-vs-403-vs-429 handling and TLS get their first real exercise in the dev
+environment — see `../pulse-infra/docs/divergences.md`. Build the upload path so
+the endpoint and credentials are configuration (`STORAGE_EMULATOR_HOST` already
+is), and keep auth/retry handling separable from batching so dev-deploy findings
+land in one place. A green local run still says nothing about auth.
 
 ## Conventions
 

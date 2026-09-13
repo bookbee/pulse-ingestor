@@ -8,26 +8,48 @@ description = "Consumes events from Kafka and writes Parquet batches to GCS stag
 publish = false
 
 [dependencies]
-# Deliberately empty for now.
-#
-# This first commit contains the part of the service whose correctness cannot be
-# fixed later without a migration: how batch boundaries are chosen, and how an
-# object name is derived from them. That logic is pure, so it needs no
-# dependencies and its tests run in a second.
-#
-# Coming next, when the consume loop lands:
-#   rdkafka        Kafka consumer with a rebalance listener (commit-after-upload)
-#   arrow/parquet  Parquet writer
-#   object_store   GCS client; honours STORAGE_EMULATOR_HOST for local fake-gcs
-#   tokio          async runtime
-#   serde/serde_json  envelope parsing
-#   anyhow/thiserror  error plumbing
-#   tracing        structured logs
-#
-# Adding one of these is a real decision: it is the difference between a crate
-# that compiles in a second and one that pulls 200 transitive dependencies.
+# --- Kafka ---------------------------------------------------------------
+# No SSL/SASL features: the local stack is PLAINTEXT everywhere. Production is
+# SASL/TLS, so `ssl` + `sasl` must be enabled before the dev deployment — that
+# is the `kafka-tls` feature below, deliberately left off so the flip is a
+# visible decision rather than a silent default.
+rdkafka = { version = "0.36", default-features = false, features = ["libz", "tokio"] }
+
+# --- Parquet -------------------------------------------------------------
+arrow = { version = "53", default-features = false }
+parquet = { version = "53", default-features = false, features = ["arrow", "zstd"] }
+
+# --- GCS -----------------------------------------------------------------
+# Plain JSON-API uploads over reqwest rather than a GCS SDK: the emulator and
+# real GCS differ only in endpoint and auth, and keeping both as seams is what
+# makes the dev-deployment auth work a single-file change. rustls, not openssl,
+# so the build needs no system TLS libraries.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# --- Runtime and plumbing ------------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Reading staging objects back in the integration test.
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[features]
+default = []
+# Enable before the dev deployment: production Kafka is SASL/TLS.
+kafka-tls = ["rdkafka/ssl", "rdkafka/sasl"]
+# Opt-in integration tests that need the `pulse-infra` stack running.
+integration = []
 
 [profile.release]
 # A throughput service: optimise across crate boundaries, and let a panic abort
