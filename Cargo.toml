@@ -1,0 +1,37 @@
+[package]
+name = "pulse-ingestor"
+version = "0.1.0"
+edition = "2021"
+# Pinned so CI and laptops agree. Raise it deliberately.
+rust-version = "1.74"
+description = "Consumes events from Kafka and writes Parquet batches to GCS staging"
+publish = false
+
+[dependencies]
+# Deliberately empty for now.
+#
+# This first commit contains the part of the service whose correctness cannot be
+# fixed later without a migration: how batch boundaries are chosen, and how an
+# object name is derived from them. That logic is pure, so it needs no
+# dependencies and its tests run in a second.
+#
+# Coming next, when the consume loop lands:
+#   rdkafka        Kafka consumer with a rebalance listener (commit-after-upload)
+#   arrow/parquet  Parquet writer
+#   object_store   GCS client; honours STORAGE_EMULATOR_HOST for local fake-gcs
+#   tokio          async runtime
+#   serde/serde_json  envelope parsing
+#   anyhow/thiserror  error plumbing
+#   tracing        structured logs
+#
+# Adding one of these is a real decision: it is the difference between a crate
+# that compiles in a second and one that pulls 200 transitive dependencies.
+
+[dev-dependencies]
+
+[profile.release]
+# A throughput service: optimise across crate boundaries, and let a panic abort
+# rather than unwind through a partially-written upload.
+lto = "thin"
+codegen-units = 1
+panic = "abort"
