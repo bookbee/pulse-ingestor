@@ -1,0 +1,17 @@
+# Build artifacts: the image builds its own, and shipping a host target/ would
+# add gigabytes to the build context.
+target/
+target-*/
+
+.git/
+.gitignore
+
+# Never bake real configuration into an image.
+.env
+.env.*
+!.env.example
+
+# Docs and tests are not needed by the runtime image.
+*.md
+tests/
+.DS_Store
