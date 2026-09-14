@@ -2,10 +2,10 @@
 
 Consumes telemetry events from Kafka and writes Parquet batches to GCS staging.
 
-> **Status: early.** The batching and configuration layers are built and tested.
-> The Kafka consume loop, the Parquet writer, and the GCS upload are not written
-> yet — `src/main.rs` validates configuration, prints what it resolved, and exits
-> non-zero so nothing mistakes it for a running ingestor.
+> **Status: working against the local stack.** The full path runs — consume →
+> batch → Parquet → GCS → commit — and is verified end to end against a real
+> 3-broker Kafka cluster and the GCS emulator. Real GCS **auth** is the
+> remaining gap, scheduled for the dev deployment.
 
 ## What it does
 
@@ -19,17 +19,33 @@ never "bronze".
 
 ## Status in detail
 
-| Module | What it does | Tests |
-|---|---|---|
-| `src/batching.rs` | `BatchRange` + `ObjectName` — fixed offset boundaries and the object names derived from them | 12 |
-| `src/config.rs` | Cross-repo contract values from the environment, no silent defaults, every problem reported at once | 7 |
-| `src/main.rs` | Loads config, reports it, exits non-zero | — |
+| Module | What it does |
+|---|---|
+| `src/batching.rs` | `BatchRange` + `ObjectName` — fixed offset boundaries and the object names derived from them |
+| `src/config.rs` | Contract values from the environment, no silent defaults, every problem reported at once |
+| `src/envelope.rs` | The gateway's wire envelope; an unparseable record becomes a value, not an error |
+| `src/parquet_writer.rs` | The staging file schema |
+| `src/pipeline.rs` | Accumulate → upload → commit, generic over a sink and a committer |
+| `src/sink.rs` | GCS over the JSON API; emulator and real GCS are one code path |
+| `src/kafka.rs` | Consumer, rebalance callback, consume loop, commits |
 
-`Cargo.toml` has **zero dependencies** on purpose. What is built here is the part
-whose correctness cannot be repaired later without a data migration, and that
-logic is pure. The dependencies the I/O layers will need (`rdkafka`, `arrow` /
-`parquet`, `object_store`, `tokio`, `serde`, `tracing`) are listed as comments in
-the manifest; adding one is a deliberate decision, not a reflex.
+**59 unit tests** run with no stack and no network — every correctness rule is
+stated against fakes. **2 integration tests** drive the same code through the
+real cluster and emulator.
+
+The layering is the point: `batching`, `envelope` and `parquet_writer` are pure,
+and `pipeline` is generic over its sink and committer, so the rules that matter
+are tested without a broker in the loop.
+
+### Not done yet
+
+- **Real GCS auth.** `sink::ApplicationDefaultCredentials` deliberately returns
+  an error rather than a half-written token flow — the emulator cannot validate
+  any of it, so code written now would be untested guesswork that looks
+  finished. Scheduled for the dev deployment.
+- **SASL/TLS Kafka.** Local brokers are PLAINTEXT. The `kafka-tls` feature turns
+  on `rdkafka`'s `ssl` and `sasl`; it is off by default so enabling it is a
+  visible decision.
 
 ## The design invariant
 
@@ -90,34 +106,47 @@ default — a wrong default looks like it worked.
 | `GCS_BUCKET` | Staging bucket |
 | `STORAGE_EMULATOR_HOST` | Optional; `host:port` of a GCS emulator. Unset means real GCS |
 
-`.env.example` also carries `KAFKA_ENABLE_AUTO_COMMIT`, `KAFKA_AUTO_OFFSET_RESET`,
-`GCS_PATH_TEMPLATE`, and `RUST_LOG`. Those are placeholders for the consume loop
-and are **not read by `config.rs` yet** — setting them today changes nothing.
+`RUST_LOG` sets the tracing filter (`pulse_ingestor=debug,rdkafka=warn` to see
+every consumed offset).
+
+Three settings are deliberately **not** configurable: `enable.auto.commit` and
+`auto.offset.reset` are forced in `src/kafka.rs`, and the object-path template is
+hardcoded in `ObjectName::for_range`. Auto-commit runs on a timer that knows
+nothing about whether the upload succeeded, and a runtime path template would let
+a config edit rename a range that was already written — turning the next retry
+into a duplicate instead of an overwrite. `.env.example` explains each omission
+where the key would otherwise have been.
 
 ## Build and test
 
 There is no Rust toolchain on the primary development machine, so builds run in a
-container. `target/` is gitignored and the container writes it as the host user,
-so no root-owned artifacts are left behind.
+container. Define this helper once per shell:
 
 ```bash
-# all tests
-docker run --rm -v "$PWD":/src -w /src rust:1-alpine sh -c \
-  'apk add --no-cache musl-dev >/dev/null; cargo test'
-
-# a single test
-docker run --rm -v "$PWD":/src -w /src rust:1-alpine sh -c \
-  'apk add --no-cache musl-dev >/dev/null; cargo test partial_batch_uses_the_full_range_name'
-
-# lint and format — both must be clean
-docker run --rm -v "$PWD":/src -w /src rust:1-alpine sh -c \
-  'apk add --no-cache musl-dev >/dev/null; rustup component add clippy rustfmt >/dev/null;
-   cargo clippy --all-targets -- -D warnings && cargo fmt --check'
+rc() { docker run --rm --network pulse-infra \
+  -v "$PWD":/src -w /src \
+  -v pulse-ingestor-cargo:/usr/local/cargo/registry \
+  -v pulse-ingestor-target:/target -e CARGO_TARGET_DIR=/target \
+  rust:1-bookworm "$@"; }
 ```
 
-`musl-dev` is required because the Alpine image builds against musl. Nothing in
-the crate depends on the container — with a real toolchain installed, plain
-`cargo test` works.
+```bash
+rc cargo test                     # 59 unit tests; no stack, no network
+rc cargo test a_partial_batch     # one test, by name prefix
+rc sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1;
+          cargo clippy --all-targets -- -D warnings && cargo fmt --check'
+
+# integration tests — needs the stack up (see below)
+rc cargo test --features integration --test integration
+```
+
+The named volumes matter: a cold dependency build takes about 90 seconds, and
+with the cache a code change rebuilds in under ten. `CARGO_TARGET_DIR` points
+away from the bind mount so container artifacts never collide with the host.
+Debian rather than Alpine because `rdkafka` compiles librdkafka from source.
+
+Nothing in the crate depends on the container — with a real toolchain installed,
+plain `cargo test` works.
 
 ## Local development
 
@@ -142,7 +171,9 @@ dev environment. That is a deliberate decision — see
 **Topics may be empty locally, and that is expected.** The gateway's Kafka
 producer is still in development (`pulse-gateway`, specced as D8–D13), so until
 it lands these topics are fed only by this service's own tests and
-`pulse-client`.
+`pulse-client`. The integration tests create and delete their own throwaway
+topics rather than using the contract ones, so their assertions do not depend on
+what previous runs left behind.
 
 ## Cross-repo contract
 

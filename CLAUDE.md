@@ -4,44 +4,79 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Early Rust crate. **Language decided 2026-09-13: Rust** (not Java).
+Feature-complete for the local stack. **Language decided 2026-09-13: Rust**
+(not Java). The full path runs: consume → batch → Parquet → GCS → commit.
 
-What exists is deliberately the part that cannot be changed later without a data
-migration:
+| Module | Role |
+|---|---|
+| `batching.rs` | Fixed offset-range boundaries and the object names from them. Pure. |
+| `config.rs` | Contract values, no silent defaults, all problems reported at once. Pure. |
+| `envelope.rs` | The gateway's wire format; unparseable records become values, not errors. Pure. |
+| `parquet_writer.rs` | The staging file schema. Pure. |
+| `pipeline.rs` | Accumulate → upload → commit, generic over a `Sink` and a `Committer`. |
+| `sink.rs` | GCS over the JSON API; emulator and real GCS differ only in endpoint and token. |
+| `kafka.rs` | Consumer, rebalance callback, consume loop, commits. |
 
-- `src/batching.rs` — fixed offset-range boundaries and the object names derived
-  from them. This is where the idempotency guarantee lives or dies. 12 tests.
-- `src/config.rs` — cross-repo contract values, loaded with no silent defaults,
-  reporting every problem at once. 7 tests.
-- `src/main.rs` — loads config, prints what it resolved, exits **non-zero**. It
-  does not idle, so nothing mistakes it for a running ingestor.
+59 unit tests plus 2 integration tests that run against the real stack. Verified
+end to end on 2026-09-14: 12 records consumed from `ingestion-events`, two
+complete ranges uploaded and committed, one partial range uploaded and *not*
+committed.
 
-**Not written yet**: the Kafka consume loop, the Parquet writer, the GCS upload.
-`Cargo.toml` has zero dependencies and lists the ones those will need, with a
-note that adding one is a real decision.
+**Still open**: real GCS auth (`sink::ApplicationDefaultCredentials` is a
+deliberate `unimplemented`-by-error, scheduled for the dev deployment), and the
+`kafka-tls` feature for the SASL/TLS brokers production uses.
 
 ## Commands
 
-**There is no Rust toolchain on this machine.** Build and test in a container:
+**There is no Rust toolchain on this machine.** Build and test in a container.
+Define this once per shell — every command below uses it:
 
 ```bash
-docker run --rm -v "$PWD":/src -w /src rust:1-alpine sh -c \
-  'apk add --no-cache musl-dev >/dev/null; cargo test'
-
-# a single test
-docker run --rm -v "$PWD":/src -w /src rust:1-alpine sh -c \
-  'apk add --no-cache musl-dev >/dev/null; cargo test partial_batch_uses_the_full_range_name'
-
-# lint and format, both of which must be clean
-docker run --rm -v "$PWD":/src -w /src rust:1-alpine sh -c \
-  'apk add --no-cache musl-dev >/dev/null; rustup component add clippy rustfmt >/dev/null;
-   cargo clippy --all-targets -- -D warnings && cargo fmt --check'
+rc() { docker run --rm --network pulse-infra \
+  -v "$PWD":/src -w /src \
+  -v pulse-ingestor-cargo:/usr/local/cargo/registry \
+  -v pulse-ingestor-target:/target -e CARGO_TARGET_DIR=/target \
+  rust:1-bookworm "$@"; }
 ```
 
-`musl-dev` is needed because the Alpine image builds against musl. `target/` is
-gitignored and the container writes it as the host user, so no root-owned
-artifacts. If a real toolchain gets installed, plain `cargo test` works —
-nothing here depends on the container.
+```bash
+rc cargo test                              # 59 unit tests, no stack needed
+rc cargo test a_partial_batch_is_not       # a single test, by name prefix
+rc cargo build --all-targets
+
+# lint and format — both must be clean
+rc sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1;
+          cargo clippy --all-targets -- -D warnings && cargo fmt --check'
+
+# integration tests: needs the pulse-infra stack up (PROFILE=core or full)
+rc cargo test --features integration --test integration
+```
+
+Three things about that invocation are deliberate:
+
+- **Debian, not Alpine.** `rdkafka` builds librdkafka from source; the musl
+  toolchain makes that harder for no gain here.
+- **Named volumes for the registry and target dir.** A cold dependency build is
+  ~90s; with the cache a code change rebuilds in under 10s. `CARGO_TARGET_DIR`
+  points *away* from the bind mount so container artifacts never collide with
+  anything on the host.
+- **`--network pulse-infra`.** Only the integration tests need it, but it is
+  harmless otherwise, and in-network addresses (`kafka-1:9092`, `fake-gcs:4443`)
+  are what the tests default to.
+
+Nothing in the crate depends on the container: with a real toolchain, plain
+`cargo test` works.
+
+To run the binary against the live stack:
+
+```bash
+rc sh -c 'KAFKA_BOOTSTRAP_SERVERS=kafka-1:9092,kafka-2:9092,kafka-3:9092 \
+  KAFKA_TOPIC_EVENTS=ingestion-events KAFKA_TOPIC_SIGNALS=ingestion-signals \
+  KAFKA_TOPIC_LOGS=ingestion-logs KAFKA_CONSUMER_GROUP=pulse-ingestor-local \
+  BATCH_OFFSET_RANGE=5 BATCH_MAX_IDLE_MS=2000 \
+  GCS_BUCKET=pulse-staging-local STORAGE_EMULATOR_HOST=fake-gcs:4443 \
+  cargo run'
+```
 
 ## The one invariant to protect
 
@@ -74,6 +109,39 @@ This was decided explicitly over the alternative (batch freely, dedup downstream
 in the silver worker). Do not "optimise" batching to be timing- or size-driven
 without revisiting that decision — it silently breaks staging as a source of
 truth.
+
+### The partial-batch rule, which is where this actually gets broken
+
+A partial flush **uploads but commits nothing, and keeps its records.** Both
+halves are load-bearing, and both look like dead weight to anyone tidying up:
+
+- **Why no commit.** A range of 10 000 holding offsets `0..=12` still has
+  `commit_offset() == 10000`. Committing that acknowledges 9 987 offsets nobody
+  read. So a partial flush commits nothing, and the range's offsets stay
+  uncommitted until it completes.
+- **Why keep the records.** If the partial flush cleared its buffer, the next
+  upload of that range would contain only `13..=9999` and would overwrite — and
+  destroy — the object holding `0..=12`. Every upload of a range must be a
+  superset of the last.
+
+The cost is bounded on purpose: an idle partition holds at most one range in
+memory and re-uploads it as it grows, and a restart re-reads from the range
+start. That trades a bounded memory cost for the elimination of an unbounded
+data-loss one.
+
+`pipeline.rs` states these as rules 1–3 and tests each; the integration test
+`a_partial_batch_is_not_committed_and_is_overwritten_when_the_range_completes`
+proves the whole cycle against a real broker. If you change flush behaviour and
+that test still passes, look again — it is the only test that would catch this.
+
+### Settings that are deliberately not configurable
+
+Three things a `.env` could plausibly expose and must not:
+`enable.auto.commit`, `auto.offset.reset` (both forced in `kafka.rs`) and the
+object-path template (hardcoded in `ObjectName::for_range`). Auto-commit runs on
+a timer that knows nothing about the upload; a runtime path template would let a
+config edit rename a range that was already written, turning the next retry into
+a duplicate instead of an overwrite. `.env.example` documents each omission.
 
 ## Upstream contract
 

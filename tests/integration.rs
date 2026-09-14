@@ -478,7 +478,10 @@ async fn a_partial_batch_is_not_committed_and_is_overwritten_when_the_range_comp
         second.records, 5,
         "the restarted consumer re-read the uncommitted offsets 0..=2"
     );
-    assert_eq!(second.commits, 1, "the completed range commits exactly once");
+    assert_eq!(
+        second.commits, 1,
+        "the completed range commits exactly once"
+    );
 
     let (rows, ids) = read_parquet(
         object_bytes(&object)
