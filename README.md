@@ -19,15 +19,17 @@ never "bronze".
 
 ## Status in detail
 
-| Module | What it does |
-|---|---|
-| `src/batching.rs` | `BatchRange` + `ObjectName` — fixed offset boundaries and the object names derived from them |
-| `src/config.rs` | Contract values from the environment, no silent defaults, every problem reported at once |
-| `src/envelope.rs` | The gateway's wire envelope; an unparseable record becomes a value, not an error |
-| `src/parquet_writer.rs` | The staging file schema |
-| `src/pipeline.rs` | Accumulate → upload → commit, generic over a sink and a committer |
-| `src/sink.rs` | GCS over the JSON API; emulator and real GCS are one code path |
-| `src/kafka.rs` | Consumer, rebalance callback, consume loop, commits |
+| Module                    | What it does                                                                                      |
+| ------------------------- | ------------------------------------------------------------------------------------------------- |
+| `src/batching.rs`       | `BatchRange` + `ObjectName` — fixed offset boundaries and the object names derived from them |
+| `src/config.rs`         | Contract values from the environment, no silent defaults, every problem reported at once          |
+| `src/envelope.rs`       | The gateway's wire envelope; an unparseable record becomes a value, not an error                  |
+| `src/parquet_writer.rs` | The staging file schema                                                                           |
+| `src/pipeline.rs`       | Accumulate → upload → commit, generic over a sink and a committer                               |
+| `src/sink.rs`           | GCS over the JSON API; emulator and real GCS are one code path                                    |
+| `src/kafka.rs`          | Consumer, rebalance callback, consume loop, commits                                               |
+| `Dockerfile`            | Multi-stage build; 117MB Debian runtime, non-root, no exposed port                                |
+| `Makefile`              | Every command below; auto-detects a host toolchain                                                |
 
 **59 unit tests** run with no stack and no network — every correctness rule is
 stated against fakes. **2 integration tests** drive the same code through the
@@ -96,15 +98,15 @@ The date is the **write** date in UTC, not an event timestamp.
 Copy `.env.example` to `.env`. Every contract value is required and has no
 default — a wrong default looks like it worked.
 
-| Variable | Meaning |
-|---|---|
-| `KAFKA_BOOTSTRAP_SERVERS` | Comma-separated broker list |
-| `KAFKA_TOPIC_EVENTS` / `_SIGNALS` / `_LOGS` | Topics to consume |
-| `KAFKA_CONSUMER_GROUP` | This service owns its group; the stack creates none |
-| `BATCH_OFFSET_RANGE` | Fixed range width, in offsets |
-| `BATCH_MAX_IDLE_MS` | How long to wait before flushing a partial trailing batch |
-| `GCS_BUCKET` | Staging bucket |
-| `STORAGE_EMULATOR_HOST` | Optional; `host:port` of a GCS emulator. Unset means real GCS |
+| Variable                                          | Meaning                                                        |
+| ------------------------------------------------- | -------------------------------------------------------------- |
+| `KAFKA_BOOTSTRAP_SERVERS`                       | Comma-separated broker list                                    |
+| `KAFKA_TOPIC_EVENTS` / `_SIGNALS` / `_LOGS` | Topics to consume                                              |
+| `KAFKA_CONSUMER_GROUP`                          | This service owns its group; the stack creates none            |
+| `BATCH_OFFSET_RANGE`                            | Fixed range width, in offsets                                  |
+| `BATCH_MAX_IDLE_MS`                             | How long to wait before flushing a partial trailing batch      |
+| `GCS_BUCKET`                                    | Staging bucket                                                 |
+| `STORAGE_EMULATOR_HOST`                         | Optional;`host:port` of a GCS emulator. Unset means real GCS |
 
 `RUST_LOG` sets the tracing filter (`pulse_ingestor=debug,rdkafka=warn` to see
 every consumed offset).
@@ -117,36 +119,68 @@ a config edit rename a range that was already written — turning the next retry
 into a duplicate instead of an overwrite. `.env.example` explains each omission
 where the key would otherwise have been.
 
+## Running it
+
+Everything goes through `make`, and every target works with or without a Rust
+toolchain on your machine — `make where` says which one you are getting.
+
+```bash
+make infra-up             # shared stack: Kafka + fake GCS (PROFILE=core)
+cp .env.example .env      # defaults target the local stack
+make run                  # run the service
+```
+
+`make help` lists every target. The ones you will use:
+
+| Target                          | What it does                                           |
+| ------------------------------- | ------------------------------------------------------ |
+| `make run`                    | Run the service against the local stack                |
+| `make image`                  | Build the production container image                   |
+| `make run-image`              | Run that image against the local stack                 |
+| `make test`                   | 59 unit tests — no stack, no network                  |
+| `make test-one NAME=…`       | One test by name substring                             |
+| `make test-integration`       | 2 integration tests — needs the stack                 |
+| `make check`                  | `fmt-check` + `lint` + `test`, what CI would run |
+| `make infra-up/-down/-health` | Wrappers over`../pulse-infra`                        |
+
+### Host or container — the addresses differ
+
+This is the one thing that catches people out:
+
+| Running                           | Kafka               | GCS                |
+| --------------------------------- | ------------------- | ------------------ |
+| On your laptop                    | `localhost:19092` | `localhost:4443` |
+| Inside the`pulse-infra` network | `kafka-1:9092`    | `fake-gcs:4443`  |
+
+`.env` holds the **host** addresses, so a native `cargo run` needs no edits. The
+container targets inject the in-network addresses as explicit `-e` overrides —
+`dotenvy` never overrides a variable that is already set, so those win over the
+bind-mounted `.env`. Without that override, a containerised run would dial
+`localhost:19092` *inside its own container* and fail looking like a dead broker.
+
 ## Build and test
 
-There is no Rust toolchain on the primary development machine, so builds run in a
-container. Define this helper once per shell:
+With no toolchain installed, every target runs in a throwaway `rust:1-bookworm`
+container against three cached named volumes — registry, rustup toolchain, and
+target dir. That cache is why a cold dependency build costs ~90 seconds and a
+code change rebuilds in under ten. `CARGO_TARGET_DIR` points away from the bind
+mount so container artifacts never collide with the host.
+
+Install a toolchain (see below) and the same `make` targets shell out to your
+local `cargo` instead — nothing in the crate depends on the container.
+
+Debian rather than Alpine, unlike `pulse-gateway`: `rdkafka` compiles librdkafka
+from source, and musl makes that more fragile for no gain here.
+
+### Optional: a native toolchain
 
 ```bash
-rc() { docker run --rm --network pulse-infra \
-  -v "$PWD":/src -w /src \
-  -v pulse-ingestor-cargo:/usr/local/cargo/registry \
-  -v pulse-ingestor-target:/target -e CARGO_TARGET_DIR=/target \
-  rust:1-bookworm "$@"; }
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+brew install cmake        # librdkafka's build needs it
 ```
 
-```bash
-rc cargo test                     # 59 unit tests; no stack, no network
-rc cargo test a_partial_batch     # one test, by name prefix
-rc sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1;
-          cargo clippy --all-targets -- -D warnings && cargo fmt --check'
-
-# integration tests — needs the stack up (see below)
-rc cargo test --features integration --test integration
-```
-
-The named volumes matter: a cold dependency build takes about 90 seconds, and
-with the cache a code change rebuilds in under ten. `CARGO_TARGET_DIR` points
-away from the bind mount so container artifacts never collide with the host.
-Debian rather than Alpine because `rdkafka` compiles librdkafka from source.
-
-Nothing in the crate depends on the container — with a real toolchain installed,
-plain `cargo test` works.
+Then `make where` reports the host toolchain and `make run` uses it directly,
+reading `.env` as-is.
 
 ## Local development
 

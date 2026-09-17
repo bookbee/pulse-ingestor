@@ -28,55 +28,42 @@ deliberate `unimplemented`-by-error, scheduled for the dev deployment), and the
 
 ## Commands
 
-**There is no Rust toolchain on this machine.** Build and test in a container.
-Define this once per shell — every command below uses it:
+Everything is a `make` target. **There is no Rust toolchain on this machine**, so
+by default each one runs in a throwaway `rust:1-bookworm` container; if `cargo`
+appears on PATH the same targets use it directly instead. `make where` reports
+which, and `make help` lists them all.
 
 ```bash
-rc() { docker run --rm --network pulse-infra \
-  -v "$PWD":/src -w /src \
-  -v pulse-ingestor-cargo:/usr/local/cargo/registry \
-  -v pulse-ingestor-target:/target -e CARGO_TARGET_DIR=/target \
-  rust:1-bookworm "$@"; }
+make infra-up                      # shared stack (PROFILE=core|full|lite)
+cp .env.example .env               # required by the run targets
+make run                           # run the service
+make test                          # 59 unit tests; no stack, no network
+make test-one NAME=a_partial_batch # one test by substring
+make test-integration              # 2 tests; REQUIRES the stack
+make check                         # fmt-check + lint + test
+make image && make run-image       # production image, run against the stack
 ```
 
-```bash
-rc cargo test                              # 59 unit tests, no stack needed
-rc cargo test a_partial_batch_is_not       # a single test, by name prefix
-rc cargo build --all-targets
+Three things about the container plumbing are deliberate:
 
-# lint and format — both must be clean
-rc sh -c 'rustup component add clippy rustfmt >/dev/null 2>&1;
-          cargo clippy --all-targets -- -D warnings && cargo fmt --check'
+- **Three cached volumes** — registry, rustup toolchain, target dir. The rustup
+  one exists because the rust image ships *no* clippy or rustfmt; without it,
+  `make lint` re-downloads them every run. `CARGO_TARGET_DIR` points away from
+  the bind mount so container artifacts never collide with the host.
+- **`--network pulse-infra` only where it is needed.** `make test` must work
+  with the stack down, so only the run and integration targets join the network.
+- **In-network addresses are injected as `-e` overrides.** `.env` holds *host*
+  addresses (`localhost:19092`); inside the network they must be `kafka-1:9092`
+  / `fake-gcs:4443`. `dotenvy` does not override already-set variables, so the
+  overrides win over the bind-mounted `.env`. A containerised run without them
+  dials `localhost:19092` inside its own container and fails looking exactly
+  like a dead broker.
 
-# integration tests: needs the pulse-infra stack up (PROFILE=core or full)
-rc cargo test --features integration --test integration
-```
-
-Three things about that invocation are deliberate:
-
-- **Debian, not Alpine.** `rdkafka` builds librdkafka from source; the musl
-  toolchain makes that harder for no gain here.
-- **Named volumes for the registry and target dir.** A cold dependency build is
-  ~90s; with the cache a code change rebuilds in under 10s. `CARGO_TARGET_DIR`
-  points *away* from the bind mount so container artifacts never collide with
-  anything on the host.
-- **`--network pulse-infra`.** Only the integration tests need it, but it is
-  harmless otherwise, and in-network addresses (`kafka-1:9092`, `fake-gcs:4443`)
-  are what the tests default to.
-
-Nothing in the crate depends on the container: with a real toolchain, plain
-`cargo test` works.
-
-To run the binary against the live stack:
-
-```bash
-rc sh -c 'KAFKA_BOOTSTRAP_SERVERS=kafka-1:9092,kafka-2:9092,kafka-3:9092 \
-  KAFKA_TOPIC_EVENTS=ingestion-events KAFKA_TOPIC_SIGNALS=ingestion-signals \
-  KAFKA_TOPIC_LOGS=ingestion-logs KAFKA_CONSUMER_GROUP=pulse-ingestor-local \
-  BATCH_OFFSET_RANGE=5 BATCH_MAX_IDLE_MS=2000 \
-  GCS_BUCKET=pulse-staging-local STORAGE_EMULATOR_HOST=fake-gcs:4443 \
-  cargo run'
-```
+The `Dockerfile` is multi-stage: deps build against dummy sources first so that
+layer survives ordinary source edits, then a 117MB `debian:bookworm-slim`
+runtime, non-root, no `EXPOSE` and no `HEALTHCHECK` — this service serves no HTTP
+surface, and liveness here is consumer lag, which belongs in monitoring rather
+than a container probe.
 
 ## The one invariant to protect
 
